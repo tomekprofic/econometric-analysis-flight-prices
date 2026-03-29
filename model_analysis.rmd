@@ -1,0 +1,569 @@
+---
+title: "EkonometriaProj"
+output: 
+  html_document:
+    code_folding: hide
+date: "2025-06-22"
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+### 1 Wprowadzenie
+
+#### 1.1 Opis projektu
+
+Projekt ma na celu budowę kompleksowego modelu ekonometrycznego służącego do analizy i prognozowania cen biletów lotniczych.
+Analiza obejmuje identyfikację czynników wpływających na poziom cen oraz ocenę jakości dopasowania modelu.
+Dane mają charakter przekrojowy i obejmują cechy połączeń lotniczych dostępnych w sprzedaży, takie jak linia lotnicza, liczba przesiadek, długość lotu czy liczba dni pozostałych do daty wylotu.
+
+Model regresji liniowej został zbudowany w szczególności dla klasy Economy – dominującej w zestawie – przy użyciu klasycznych oraz zaawansowanych technik modelowania (m.in. interakcje zmiennych, transformacje logarytmiczne, splajny).
+Końcowym etapem projektu jest wykonanie predykcji cen na zbiorze testowym oraz ocena błędów predykcji.
+
+#### 1.2 Zmienne
+
+##### 1.2.1 Zmienna objaśniana
+
+**price** – cena biletu lotniczego (w złotych)
+
+##### 1.2.2 Zmienne objaśniające
+
+-   **airline** – linia lotnicza (np. AirAsia, Vistara, Lufthansa)
+-   **stops** – liczba przesiadek (zero, one, two_or_more)
+-   **duration** – czas trwania lotu (w godzinach)
+-   **days_left** – liczba dni do daty wylotu
+-   **departure_time** – pora wylotu (np. Morning, Evening, Early_Morning)
+-   **arrival_time** – pora przylotu (np. Afternoon, Night)
+-   **class** – klasa biletu (Economy lub Business)
+-   **source_city** – miasto wylotu (np. Delhi, Mumbai)
+-   **destination_city** – miasto przylotu (np. Mumbai, Bangalore
+
+#### 1.3 Źródła
+
+<https://www.kaggle.com/datasets/dhirajbembade/indian-airlines-ticket-price-analysis>
+
+#### 1.4 Biblioteki
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+library(tidyverse)
+library(strucchange)
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(car)
+library(lmtest) 
+library(tseries)
+library(sandwich)
+library(car)
+library(mgcv)
+library(readr)
+library(ggcorrplot)
+```
+
+### 2 Wczytywanie danych
+
+Dane pochodzą ze strony <https://www.kaggle.com/datasets/dhirajbembade/indian-airlines-ticket-price-analysis> Zawierają informacje o ponad 300 000 połączeniach lotniczych.
+Ze względu na dużą liczność danych, do analizy wykorzystano losową próbkę 30 000 obserwacji.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+df_full <- read_csv("Clean_Dataset.csv")
+```
+
+### 3 Opis i wstępna obróbka danych
+
+```{r}
+set.seed(123)
+df <- df_full %>% sample_n(30000) 
+```
+
+#### 3.1 Podstawowe statystyki
+
+##### Sprawdzanie braków.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+colSums(is.na(df))
+```
+
+Nie występują braki danych:)
+
+```{r}
+summary(df)
+glimpse(df)
+```
+
+Zmiennymi kategorycznymi są airline, source_city, departure_time, stops, arrival_time, destination_city oraz class – każda z nich przyjmuje skończoną liczbę wartości (np. airline to kilka nazw linii lotniczych, a stops to trzy możliwe opcje: zero, one, two_or_more).
+Wśród tych zmiennych widać wyraźną nierównowagę – niektóre kategorie dominują, np.
+Vistara w airline, Delhi w source_city czy klasa ekonomiczna w class.
+W przypadku departure_time i arrival_time rozkład jest bardziej zróżnicowany, ale nadal niektóre pory dnia (rano, wieczór) występują częściej.
+
+Z kolei duration, days_left i price to zmienne liczbowe o rozkładach ciągłych lub dyskretnych.
+Duration (czas lotu) ma rozkład prawdopodobnie skośny, z większością lotów trwających od kilku do kilkunastu godzin, ale z pojedynczymi, bardzo długimi połączeniami (co sugeruje obecność wartości odstających).
+Days_left to zmienna dyskretna, liczba dni do wylotu, rozkładająca się od 1 do 49, z większym zagęszczeniem wartości w dolnej połowie zakresu (więcej rezerwacji na krótko przed lotem).
+Price, czyli cena biletu, to zmienna ciągła o bardzo szerokim rozrzucie i silnej prawostronnej skośności – większość cen skupia się wokół mediany (\~7400), ale występują też bardzo drogie bilety, co podnosi średnią i sugeruje obecność wartości odstających.
+
+#### 3.2 Wizualizacja danych
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Histogram cen biletów
+ggplot(df, aes(x = price)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "black") +
+  theme_minimal() +
+  labs(title = "Rozkład cen biletów", x = "Cena", y = "Liczba obserwacji")
+
+# Średnia cena w zależności od klasy biletu
+df %>%
+  group_by(class) %>%
+  summarise(avg_price = mean(price)) %>%
+  ggplot(aes(x = class, y = avg_price, fill = class)) +
+  geom_col() +
+  labs(title = "Średnia cena biletu wg klasy", y = "Średnia cena")
+
+# Wykres zależności ceny od liczby dni do wylotu
+ggplot(df, aes(x = days_left, y = price)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  theme_minimal() +
+  labs(title = "Cena biletu a liczba dni do wylotu")
+```
+
+#### 3.3 Transformacja zmiennych i redukcja
+
+Dokonano konwersji zmiennych jakościowych (`airline`, `stops`, `class`, itd.) do formatu `factor`, co jest wymagane przy modelowaniu regresji liniowej z udziałem zmiennych kategorycznych.
+Dodatkowo usunięto zbędne kolumny (`flight`, indeksy).
+
+Z pomocą funkcji `select()` ograniczono zbiór do niezbędnych zmiennych, co uprościło dalsze przetwarzanie danych i budowę modelu.
+
+Dane podzielono na zbiór treningowy (80%) oraz testowy (20%) z użyciem funkcji `createDataPartition()` z pakietu `caret`.
+Zapewnia to proporcjonalny podział względem zmiennej celu (`price`) i umożliwia niezależną walidację modelu.
+
+```{r}
+df <- df %>% mutate(across(c(airline, source_city, departure_time, stops,
+                             arrival_time, destination_city, class), as.factor)) %>%
+  select(2,4:12)
+str(df)
+
+set.seed(123)  # powtarzalność
+train_index <- createDataPartition(df$price, p = 0.8, list = FALSE)
+
+train_df <- df[train_index, ]
+test_df  <- df[-train_index, ]
+
+```
+
+#### 3.3 Macierz korelacji
+
+```{r message=FALSE, warning=FALSE}
+df <- df %>%
+  mutate(stops_num = case_when(
+    stops == "zero" ~ 0,
+    stops == "one" ~ 1,
+    stops == "two_or_more" ~ 2
+  ))
+
+cor_mat <- df %>%
+  select(duration, days_left, price, stops_num) %>%
+  cor(use = "pairwise.complete.obs")
+
+if (!require(ggcorrplot)) install.packages("ggcorrplot")
+
+ggcorrplot(cor_mat, 
+           hc.order = TRUE, 
+           type = "lower", 
+           lab = TRUE, 
+           title = "Macierz korelacji: duration, days_left, price, stops")
+```
+
+Największy wpływ na czas trwania lotu ma liczba przesiadek, a na cenę – czas trwania lotu.
+Liczba dni do wylotu nie wpływa znacząco na pozostałe cechy.
+Ogólnie korelacje nie są bardzo wysokie, więc żadne z tych zmiennych nie są ze sobą silnie powiązane, poza logicznym związkiem między przesiadkami a długością podróży.
+
+### 4 Budowa Modelu Ekonometrycznego
+
+#### 4.1 Budowa modelu bazowego
+
+```{r}
+model <- lm(price ~ airline + class + stops + duration + days_left, data = train_df)
+summary(model)
+par(mfrow = c(2, 2))
+plot(model)
+```
+
+Na początku zbudowano podstawowy model regresji liniowej dla całego zbioru treningowego.
+Zmienną objaśnianą była cena biletu (`price`), a zmiennymi objaśniającymi: linia lotnicza, klasa biletu, liczba przesiadek, długość lotu oraz liczba dni do wylotu.
+
+#### 4.2 Test Chowa
+
+```{r}
+table(df$class)
+# Sortujemy dane
+train_df <- train_df %>% arrange(class)
+split_point <- which(train_df$class == "Economy")[1]  # pierwszy wiersz klasy Economy
+
+# Model pełny
+model_chow <- lm(price ~ airline + stops + duration + days_left + arrival_time, data = train_df)
+
+# Test Chowa
+chow_result <- sctest(model_chow, type = "Chow", point = split_point)
+chow_result
+```
+
+W celu sprawdzenia, czy różne klasy biletów (Business i Economy) mogą być analizowane wspólnie, przeprowadzono test strukturalny Chowa.
+W tym celu uporządkowano dane według klasy i ustalono punkt podziału.
+Wynik testu wskazał na istotne różnice między klasami, co uzasadnia dalsze skupienie na budowie odrębnego modelu wyłącznie dla klasy Economy.
+
+#### 4.3 Model regresji dla klasy Economy
+
+```{r}
+train_economy  <- train_df %>% filter(class == "Economy")
+test_economy <- test_df %>% filter(class == "Economy")
+model_economy  <- lm(price ~ airline + stops + duration + days_left, data = train_economy)
+summary(model_economy)
+
+par(mfrow = c(2, 2))
+plot(model_economy)
+```
+
+Ograniczono się do obserwacji klasy Economy.
+Na tym zbiorze zbudowano model regresji liniowej z podstawowymi zmiennymi wyjaśniającymi.
+Wykresy diagnostyczne nadal wskazywały na możliwe odstępstwa od założeń, m.in.
+obecność outlierów oraz nieliniowość.
+
+#### 4.4 Interakcje między linią lotniczą a przesiadkami
+
+```{r}
+train_economy %>%
+  group_by(airline, stops) %>%
+  summarise(mean_price = mean(price), .groups = "drop") %>%
+  arrange(desc(mean_price))
+      
+    
+model_economy1  <- lm(price ~ airline * stops + duration + days_left, data =train_economy)
+summary(model_economy1)
+```
+
+Ogromne różnice między liczbą przesiadek wewnątrz jednej linii lotniczej: u Air_India różnica między two_or_more a zero to ponad 7 000 zł, u Vistary to prawie 6 000 zł, u AirAsia to tylko ok. 1 200 zł.
+Dlatego w modelu wprowadzono interakcję `airline * stops`.
+Poprawiło to dopasowanie modelu, co potwierdził wzrost współczynnika determinacji (`R²`).
+Interakcja okazała się istotna statystycznie.
+
+#### 4.5 Wpływ godziny przylotu
+
+```{r}
+plot(train_economy$departure_time,
+     train_economy$price,
+     main = "Cena biletu vs Godzina odjazdu",
+     xlab = "Godzina odjazdu",
+     ylab = "Cena biletu",
+     pch = 19,       # punkt jako pełne kółko
+     col = "blue")   # kolor punktów
+
+# Wykres 2: Cena w zależności od godziny przyjazdu
+plot(train_economy$arrival_time,
+     train_economy$price,
+     main = "Cena biletu vs Godzina przyjazdu",
+     xlab = "Godzina przyjazdu",
+     ylab = "Cena biletu",
+     pch = 19,
+     col = "lightblue")
+```
+
+W kolejnym kroku do modelu dodano zmienną `arrival_time`, czyli godzinę przylotu.
+Celem było sprawdzenie, czy pora zakończenia podróży wpływa na cenę biletu.
+
+```{r}
+model_economy2  <- lm(price ~ airline * stops + duration + days_left +arrival_time , data = train_economy)
+summary(model_economy2)
+```
+
+Włączenie tej zmiennej poprawiło dopasowanie modelu.\
+
+#### 4.6 Transformacja zmiennej zależnej (logarytm)
+
+```{r}
+train_economy <- train_economy %>%
+  mutate(log_price = log(price))
+
+# Histogram ceny
+ggplot(train_economy, aes(x = price)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "black") +
+  labs(title = "Histogram ceny (price)", x = "price", y = "Liczba obserwacji")
+
+# Histogram log_ceny
+ggplot(train_economy, aes(x = log_price)) +
+  geom_histogram(bins = 50, fill = "orange", color = "black") +
+  labs(title = "Histogram logarytmu ceny (log_price)", x = "log(price)", y = "Liczba obserwacji")
+
+model_log <- lm(log_price ~ airline + stops + duration + days_left + arrival_time, data = train_economy)
+summary(model_log) 
+```
+
+Zmienna `price` charakteryzowała się prawoskośnym rozkładem.
+W celu poprawy normalności i stabilności wariancji, dokonano logarytmizacji ceny (`log(price)`).
+Histogramy potwierdziły, że transformacja poprawia symetrię rozkładu.
+Następnie zbudowano model regresji dla `log_price`, co pozwoliło na interpretację współczynników jako procentowych zmian ceny.
+
+#### 4.7 Testowanie transformacji zmiennych liczbowych
+
+```{r}
+duration_vars <- list(
+  linear = "duration",
+  log = "log(duration)",
+  pow2 = "I(duration^2)",
+  pow3 = "I(duration^3)"
+)
+
+days_vars <- list(
+  linear = "days_left",
+  log = "log(days_left + 1)",
+  pow2 = "I(days_left^2)",
+  pow3 = "I(days_left^3)"
+)
+
+test_model <- function(dur, day) {
+  fmla_text <- paste("log(price) ~ airline * stops +", duration_vars[[dur]], "+", days_vars[[day]], "+ arrival_time")
+  model <- lm(as.formula(fmla_text), data = train_economy)
+  
+  tibble(
+    duration = dur,
+    days_left = day,
+    adj_r2 = round(summary(model)$adj.r.squared, 4),
+    reset_p = round(resettest(model, power = 2:3, type = "regressor")$p.value, 4)
+  )
+}
+
+results <- expand.grid(dur = names(duration_vars), day = names(days_vars), stringsAsFactors = FALSE) %>%
+  rowwise() %>%
+  do(test_model(.$dur, .$day)) %>%
+  ungroup()
+
+print(results %>% arrange(desc(adj_r2)))
+```
+
+Aby lepiej uchwycić zależności między zmiennymi liczbowymi a ceną, przetestowano różne przekształcenia zmiennych `duration` oraz `days_left` (m.in. logarytmy, kwadraty i sześciany).
+Dla każdej kombinacji obliczono `adjusted R²` oraz przeprowadzono test RESET.
+Najlepsze rezultaty osiągnięto dla logarytmicznej transformacji obu zmiennych.
+
+#### 4.8 Wizualna ocena transformacji
+
+```{r}
+p1 <- ggplot(train_economy, aes(x = days_left, y = price)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess", se = FALSE, color = "blue") +
+  labs(title = "Price vs Days Left")
+p2 <- ggplot(train_economy, aes(x = log(days_left), y = price)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess", se = FALSE, color = "blue") +
+  labs(title = "Price vs log(Days Left)")
+
+p3 <- ggplot(train_economy, aes(x = duration, y = price)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  labs(title = "Price vs Duration")
+p4 <- ggplot(train_economy, aes(x = log(duration), y = price)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  labs(title = "Price vs log(Duration)")
+
+print(p1); print(p2); print(p3); print(p4)
+```
+
+Za pomocą wykresów rozrzutu oceniono zależność ceny od zmiennych `days_left` i `duration` oraz ich logarytmów.
+Zależności te okazały się nieliniowe w skali oryginalnej, natomiast po transformacji logarytmicznej przyjmowały bardziej liniowy charakter, co wspierało wybór odpowiedniego przekształcenia w modelu.
+
+#### 4.9 Model końcowy
+
+```{r}
+model_final <- lm(log_price ~ airline * stops + log(duration) + log(days_left + 1) + arrival_time, data = train_economy)
+summary(model_final)
+```
+
+Ostateczny model regresji log-liniowej uwzględniał: interakcję `airline * stops`, logarytm długości lotu, logarytm liczby dni do wylotu oraz godzinę przylotu.
+Model ten cechował się wysokim współczynnikiem `adjusted R²` i poprawnym zachowaniem względem testów nieliniowości.
+Stanowił bazę do dalszej diagnostyki oraz etapu predykcji.\
+
+### 5 Diagnostyka
+
+#### 5.1 Wykresy diagnostyczne (reszty, dźwignia, itp.)
+
+```{r}
+par(mfrow = c(2, 2))
+plot(model_final)
+```
+
+W celu oceny założeń klasycznego modelu liniowego przeprowadzono analizę wykresów diagnostycznych.
+Na wykresie Residuals vs Fitted reszty są rozproszone dość równomiernie wokół osi zerowej, co sugeruje brak poważnych nieliniowości oraz poprawną specyfikację modelu.
+Nie obserwuje się typowego efektu lejka, więc można przyjąć, że warunek homoskedastyczności jest w przybliżeniu spełniony.
+Wykres Q-Q Residuals wskazuje, że w środkowym zakresie rozkładu reszty są zgodne z rozkładem normalnym, natomiast niewielkie odchylenia w ogonach mogą świadczyć o lekkim odstępstwie od normalności — co jednak przy dużej liczbie obserwacji nie wpływa znacząco na wyniki.
+W Scale-Location plot nie widać wyraźnych wzorców świadczących o heteroskedastyczności — odchylenia są w miarę równomierne w całym zakresie wartości dopasowanych.
+W Residuals vs Leverage nie występują obserwacje o bardzo wysokim leverage lub dużej wartości Cook's distance, co sugeruje, że nie ma pojedynczych obserwacji o nadmiernym wpływie na estymację modelu.
+Podsumowując, wykresy diagnostyczne nie wykazują poważnych nieprawidłowości, a model można uznać za poprawnie dopasowany w kontekście podstawowych założeń MNK.
+
+#### 5.2 Test RESET (nieliniowość)
+
+```{r}
+resettest(model_final, power = 2:3, type = "regressor")
+
+model_gam <- gam(log_price ~ airline * stops + s(duration) + s(days_left) + arrival_time, data = train_economy)
+summary(model_gam)
+plot(model_gam, pages = 1, residuals = TRUE, se = TRUE)
+
+AIC(model_final, model_gam)
+```
+
+Test RESET pokazał, że powinniśmy odrzucić idealną liniową postać tego modelu dlatego dalej badamy również model GAM (ang. Generalized Additive Model).
+Model GAM ujmuje niuanse nieliniowe, lecz czyni to kosztem znacznie większej złożoności i utraty intuicyjnej interpretacji β.
+W kontekście menedżerskiego wykorzystania – gdzie liczy się szybka symulacja wpływu „+10 dni do wylotu” albo „+1 przesiadka” – log-liniowy model_final spełnia kryterium adekwatności:wysokie, ale nieprzesadzone adj.
+R² ≈ 0.55,przejrzyste, ekonomicznie sensowne znaki parametrów,brak poważnych problemów diagnostycznych.
+
+W modelu GAM można zauważyć, że zarówno czas trwania lotu, jak i liczba dni do wylotu mają istotny, nieliniowy wpływ na cenę biletu.
+W przypadku czasu trwania lotu (duration) ceny pozostają względnie stabilne dla krótszych tras, natomiast wyraźny wzrost cen pojawia się dopiero przy bardzo długich lotach, powyżej około 30 godzin.
+Z kolei liczba dni do wylotu (days_left) pokazuje, że ceny biletów są najwyższe przy rezerwacjach na ostatnią chwilę, a następnie gwałtownie spadają, stabilizując się na niższym poziomie, gdy bilet kupowany jest z większym wyprzedzeniem.
+Oba te czynniki mają więc znaczący i nieliniowy wpływ na cenę, przy czym wcześniejszy zakup oraz krótszy czas podróży sprzyjają niższym kosztom biletu.
+
+#### 5.3. Test Breuscha-Pagana (heteroskedastyczność)
+
+```{r}
+bptest(model_final)
+bptest(model_gam)
+coeftest(model_final, vcov = vcovHC(model_gam, type = "HC1"))
+coeftest(model_gam, vcov = vcovHC(model_gam, type = "HC1"))
+```
+
+W celu zbadania poprawności założeń modelu, przeprowadzono test Breuscha–Pagana dla klasycznego modelu liniowego (`model_final`) oraz modelu uogólnionego addytywnego (`model_gam`).
+W obu przypadkach otrzymano bardzo niskie wartości p-value (\< 2.2e-16), co wskazuje na istotną statystycznie heteroskedastyczność reszt.
+Oznacza to, że wariancja składnika losowego nie jest stała, co może prowadzić do błędnych wniosków przy standardowej estymacji.
+W związku z tym zastosowano estymację odporną na heteroskedastyczność za pomocą korekty White’a (przez `vcovHC`).
+
+#### 5.4. Sprawdzanie normalności reszt i test Jarque Bera
+
+```{r}
+residuals_gam <- residuals(model_gam)
+jarque.bera.test(residuals_gam)
+```
+
+W celu oceny zgodności rozkładu reszt z rozkładem normalnym przeprowadzono test Jarque-Bera.
+Uzyskano wartość statystyki testowej X² = 2211.1, przy liczbie stopni swobody równej 2 oraz bardzo niskim poziomie istotności p \< 2.2e-16.
+Taki wynik jednoznacznie wskazuje na odrzucenie hipotezy zerowej o normalności rozkładu reszt.
+
+Tego rodzaju wynik nie jest zaskakujący przy dużych próbach, ponieważ testy normalności są bardzo czułe na nawet niewielkie odchylenia.
+Niemniej jednak, niezgodność z normalnością może wpływać na poprawność klasycznych testów istotności (opartych na założeniu o normalnych resztach), dlatego w analizie zastosowano korektę wariancji odporną na heteroskedastyczność i brak normalności (vcovHC).
+
+```{r}
+hist(residuals(model_gam), breaks = 50, main = "Histogram reszt", xlab = "Residuals")
+qqnorm(residuals(model_gam))
+qqline(residuals(model_gam), col = "red")
+```
+
+Reszty są wyraźnie dzwonowate (histogram), ale QQ-plot pokazuje lekkie odstępstwa w skrajnych ogonach: obserwacje ekstremalne leżą powyżej linii odniesienia po prawej i poniżej po lewej, co wskazuje na niewielką leptokurtozę.
+W efekcie test Jarque-Bera przy tak dużej próbie odrzuca normalność (p \< 2·10⁻¹⁶), choć wizualnie większość masy reszt mieści się blisko rozkładu normalnego.
+W praktyce oznacza to, że centralna część rozkładu jest dobrze odwzorowana.
+
+#### 5.5 Współliniowość
+
+```{r}
+model_simple <- lm(log_price ~ airline + stops + log(duration) + log(days_left + 1) + arrival_time, data = train_economy)
+vif(model_simple)
+```
+
+Przeprowadzając analizę współliniowości na modelu uproszczonym o interakcję dochodzimy do wniosków: W modelu nie występuje istotna współliniowość między zmiennymi objaśniającymi.
+Wszystkie wartości VIF\^(1/(2\*Df)) są znacznie poniżej powszechnie przyjmowanej granicy 5, a nawet 2.
+Szczególną uwagę można zwrócić jedynie na zmienną `log(duration)`, która osiąga wartość 1.90 – wskazuje to na umiarkowaną korelację z innymi zmiennymi, ale nie na poziomie wymagającym interwencji.
+
+Model pod względem współliniowości jest stabilny i dobrze uwarunkowany, co oznacza, że oszacowania parametrów są wiarygodne, a ryzyko niestabilności estymacji – niskie.
+
+### 6. Predykcja
+
+```{r}
+test_economy <- test_economy %>%
+  mutate(
+    pred_log_price = predict(model_final, newdata = test_economy),  # predykcja na skali log_price
+    pred_price = exp(pred_log_price),                              # przeskalowanie do oryginalnej skali price
+    error = pred_price - price,                                    # błąd bezwzględny
+    abs_error = abs(error),
+    rel_error = error / price                                      # względny błąd (procentowy)
+  )
+```
+
+### 7. Podsumowanie błędów
+
+```{r}
+rmse <- sqrt(mean(test_economy$error^2))
+mae <- mean(test_economy$abs_error)
+cat(sprintf("RMSE: %.2f\nMAE: %.2f\n", rmse, mae))
+```
+
+Średnie błędy uzyskane na zbiorze testowym pokazują, że nasz log-liniowy model wyceny biletów w klasie Economy nie jest jeszcze wystarczająco precyzyjny: przeciętny błąd absolutny MAE wynosi ok. 1695 zł, a większa wrażliwość RMSE (≈ 2533 zł) wskazuje, że kilka skrajnych obserwacji mocno podwyższa błąd średniokwadratowy.
+Przekłada się to na MAPE na poziomie około 27 %, czyli prognozowana cena odbiega od rzeczywistej średnio o jedną czwartą wartości biletu.
+Taki poziom trafności jest do zaakceptowania na etapie analiz eksploracyjnych, gdzie zależy nam głównie na wychwyceniu ogólnych zależności i kierunków zmian, natomiast dla zastosowań stricte operacyjnych—np.
+dynamicznego ustalania cen—błąd pozostaje zbyt wysoki.
+W praktyce oznacza to potrzebę dalszego udoskonalenia modelu: warto rozważyć dodanie zmiennych sezonowych i dnia tygodnia, uwzględnić ewentualne interakcje z trasą czy porą roku oraz zidentyfikować i złagodzić wpływ outlierów, które obecnie najmocniej podbijają RMSE.
+
+### 8. Wykresy błędów
+
+```{r}
+# Residuals vs Predicted (na oryginalnej skali)
+p1 <- ggplot(test_economy, aes(x = pred_price, y = error)) +
+  geom_point(alpha = 0.4) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Residuals vs Predicted Price", x = "Predicted Price", y = "Residuals (Error)")
+
+# Predykcje vs Obserwacje (skala log_price)
+p2 <- ggplot(test_economy, aes(x = log(price), y = pred_log_price)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, color = "blue", linetype = "dashed") +
+  labs(title = "Predicted vs Observed log(Price)", x = "Observed log(Price)", y = "Predicted log(Price)")
+
+# Histogram rozkładu błędów
+p3 <- ggplot(test_economy, aes(x = error)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "black") +
+  labs(title = "Histogram błędów predykcji (Residuals)", x = "Error (Predicted Price - Price)", y = "Liczba obserwacji")
+
+# Wszystkie trzy wykresy
+library(gridExtra)
+grid.arrange(p1, p2, p3, nrow = 2)
+```
+
+Histogram błędów predykcji pokazuje, że większość reszt skupia się blisko zera – rozkład jest dość symetryczny i przypomina dzwon, co potwierdza, że model na ogół nie ma systematycznej tendencji do stałego przeszacowywania lub niedoszacowywania ceny.
+Jednocześnie długie, rzadkie ogony (sięgające ±10 000 zł, sporadycznie nawet ±20 000 zł) wskazują, że w zbiorze testowym trafiają się pojedyncze, ekstremalnie drogie lub tanie bilety, dla których prognoza mocno chybiła.
+
+Wykres Residuals vs Predicted Price ujawnia narastającą rozpiętość błędów wraz ze wzrostem prognozowanej ceny: przy tanich biletach rozrzut oscyluje wokół kilku tysięcy złotych, a przy najdroższych potrafi przekroczyć ±10 000 zł.
+Taka „rozchodząca się chmura” sugeruje heteroskedastyczność – model coraz mniej precyzyjnie wycenia bilety premium.
+Czerwona linia na poziomie 0 przebiega przez medianę reszt, więc przeciętne błędy dodatnie i ujemne znoszą się, ale wariancja rośnie razem z ceną.
+
+Ostatni panel – Predicted vs Observed log(Price) – prezentuje silną dodatnią korelację; punkty gęsto otaczają linię 45°, co potwierdza, że w skali logarytmicznej model dobrze odwzorowuje ogólny trend cen.
+Odchylenia od linii rosną przy skrajnie niskich i skrajnie wysokich wartościach log(ceny), korespondując z obserwowaną wcześniej heteroskedastycznością na skali naturalnej.
+
+Podsumowując: model trafnie oddaje przeciętny poziom log-cen i nie wykazuje systematycznego biasu, lecz jego precyzja spada dla najdroższych biletów, co widoczne jest w poszerzających się ogonach rozkładu błędów i w rosnącej wariancji reszt przy wysokich wartościach przewidywanej ceny.
+
+### 9. Podsumowanie
+
+Wzięliśmy próbkę 30 000 biletów i szybko zauważyliśmy, że klasa Business zaniża nam cały model.
+Dlatego zostaliśmy przy klasie Economy (ok. 16,5 tys. sztuk).
+
+Model, który finalnie zostawiliśmy: lm(price \~ airline \* stops + duration + days_left +arrival_time , data = train_economy)
+
+Interakcja airline×stops = różne linie, różne „kary”/zniżki za przesiadki.
+
+Logi przy duration i days_left wyrównują nieliniowość i dają fajną interpretację w % (np. +10 % dni do wylotu ≈ –3 % ceny).
+
+Jak nam to wyszło?
+Adj.
+R² ≈ 0,55 przy 25 parametrach → nie jest idealnie, ale tragedii też nie ma.
+Test Breuscha–Pagana krzyczy „heteroskedastyczność!”
+, więc użyliśmy robust-SE.
+RESET mówi, że trochę nieliniowości zostało, ale na wykresach reszt nie widać dramatu.
+Błędy na zbiorze testowym (ok. 3 tys. biletów)
+
+RMSE ≈ 2 500 zł
+
+MAE ≈ 1 700 zł
+
+MAPE ≈ 27 %
+
+Histogram reszt jest ładnie dzwonowaty, ale im droższy bilet, tym większy rozrzut – stąd wysokie procenty.
+
+Co z tego wynika Kupuj wcześniej – każde +10 % czasu do wylotu to \~3 % taniej.l Przesiadki zwykle zbijają cenę, najmocniej u AirAsia.
+Długie loty (powyżej \~30 h) zaczynają znowu drożeć.
+Godzina lądowania ma skromny, ale istotny wpływ – poranki wychodzą najtaniej.
+Co byśmy poprawili w kolejnej iteracji Dorzucić zmienną „miesiąc/święta” i „dzień tygodnia”.
+Rozbić trasy krajowe vs międzynarodowe.
