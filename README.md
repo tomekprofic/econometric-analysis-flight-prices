@@ -1,4 +1,6 @@
 # Analiza Ekonometryczna Cen Biletów Lotniczych
+## Podgląd
+https://htmlpreview.github.io/?https://github.com/tomekprofic/econometric-analysis-flight-prices/blob/main/model_analysis.html
 
 ## Opis projektu
 Celem projektu jest budowa modelu ekonometrycznego służącego do prognozowania cen biletów lotniczych (klasa Economy) na podstawie danych z rynku indyjskiego. Analiza skupia się na identyfikacji kluczowych czynników cenotwórczych oraz optymalizacji modelu pod kątem dokładności predykcji.
